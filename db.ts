@@ -12,11 +12,18 @@ const SCHEMA_SQL = `
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_search;
+CREATE EXTENSION IF NOT EXISTS pg_cron;
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+CREATE EXTENSION IF NOT EXISTS unaccent;
+CREATE EXTENSION IF NOT EXISTS fuzzystrmatch;
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+CREATE EXTENSION IF NOT EXISTS ltree;
 
 CREATE TABLE IF NOT EXISTS code_chunks (
     id          BIGSERIAL PRIMARY KEY,
     project     TEXT NOT NULL,
     file_path   TEXT NOT NULL,
+    file_path_ltree ltree GENERATED ALWAYS AS (replace(replace(file_path, '/', '.'), '_', '~')::ltree) STORED,
     language    TEXT,
     symbol_type TEXT,
     symbol_name TEXT,
@@ -33,6 +40,7 @@ CREATE INDEX IF NOT EXISTS idx_chunks_project ON code_chunks (project);
 CREATE INDEX IF NOT EXISTS idx_trgm ON code_chunks USING gin (content gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS idx_hash ON code_chunks (content_hash);
 CREATE INDEX IF NOT EXISTS idx_meta ON code_chunks USING gin (metadata);
+CREATE INDEX IF NOT EXISTS idx_ltree ON code_chunks USING gist (file_path_ltree);
 `;
 
 export interface ChunkRow {
@@ -119,6 +127,22 @@ export async function ensureSchema(pool: Pool): Promise<void> {
       USING hnsw (embedding vector_cosine_ops)
       WITH (m = 16, ef_construction = 64)
     `);
+	}
+
+	// Schedule maintenance jobs via pg_cron
+	try {
+		await pool.query(`
+			SELECT cron.schedule('0 */6 * * *', $$
+				VACUUM ANALYZE code_chunks
+			$$);
+		`);
+		await pool.query(`
+			SELECT cron.schedule('30 */6 * * *', $$
+				REINDEX INDEX CONCURRENTLY IF EXISTS idx_bm25
+			$$);
+		`);
+	} catch (err) {
+		console.error("[codebase-index] pg_cron scheduling failed:", (err as Error).message);
 	}
 }
 
