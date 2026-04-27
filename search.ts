@@ -1,18 +1,21 @@
 /**
- * search.ts — Hybrid search: trigram + BM25 + pgvector → RRF → rerank
+ * search.ts — Hybrid search: rg + trigram + BM25 + pgvector → RRF → rerank
  *
- * Combines three search strategies via Reciprocal Rank Fusion (RRF):
- * 1. pg_trgm — regex / fuzzy substring matching
+ * Runs ALL four search strategies in parallel every time:
+ * 1. ripgrep — fast exact/regex file matching
  * 2. BM25 (ParadeDB pg_search) — full-text keyword search with proper scoring
- * 3. pgvector — semantic vector similarity
+ * 3. pg_trgm — regex / fuzzy substring matching
+ * 4. pgvector — semantic vector similarity
  *
- * The results are fused with RRF, then optionally reranked via DeepInfra.
+ * Results are fused with Reciprocal Rank Fusion (RRF), then reranked via DeepInfra.
+ * No mode picking. Fire everything, let fusion decide.
  */
 
 import type { Pool } from "pg";
 import type { SearchResult } from "./db.js";
 import { embedQuery } from "./embed.js";
 import { type RerankItem, rerank } from "./rerank.js";
+import { rgSearch } from "./rg_search.js";
 
 // RRF constant (standard value from academic literature)
 const RRF_K = 60;
@@ -26,18 +29,7 @@ interface SearchOptions {
 	language?: string;
 	maxResults?: number;
 	signal?: AbortSignal;
-}
-
-/**
- * Detect the best search mode for a query.
- */
-function detectMode(query: string): SearchMode {
-	if (/[\\^$.*+?[\]{}()|]/.test(query)) return "regex";
-	const words = query.split(/\s+/);
-	if (words.length <= 3 && words.every((w) => /^[\w.]+$/.test(w))) {
-		return "keyword";
-	}
-	return "semantic";
+	rootDir: string;
 }
 
 // ── Individual search strategies ────────────────────────────────────────────
@@ -70,6 +62,37 @@ function whereClause(
 	return { sql, params };
 }
 
+/**
+ * Sanitize a query for use with PostgreSQL regex (~* operator).
+ * - Collapses whitespace/newlines
+ * - Escapes regex metacharacters
+ * - Truncates to avoid huge patterns
+ */
+function sanitizePgRegex(query: string): string {
+	let q = query.replace(/\s+/g, " ").trim();
+	// Escape POSIX regex metacharacters so the query is treated as literal
+	q = q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	if (q.length > 200) q = q.slice(0, 200);
+	return q;
+}
+
+/**
+ * Sanitize a query for ParadeDB BM25 full-text search.
+ * - Extracts meaningful search tokens from natural language
+ * - Falls back to simple term-based search if parse fails
+ */
+function sanitizeBm25Query(query: string): string {
+	// Collapse whitespace and strip newlines
+	let q = query.replace(/\s+/g, " ").trim();
+	// Truncate long queries
+	if (q.length > 200) q = q.slice(0, 200);
+	// Extract word-like tokens for ParadeDB simple term query
+	const tokens = q.match(/\w+/g);
+	if (!tokens || tokens.length === 0) return "";
+	// Use simple term-based query: each token is searched as a column term
+	return tokens.slice(0, 10).map((t) => `content:${t}`).join(" OR ");
+}
+
 async function regexSearch(
 	pool: Pool,
 	project: string,
@@ -77,6 +100,8 @@ async function regexSearch(
 	language: string | undefined,
 	limit: number,
 ): Promise<RawHit[]> {
+	const sanitized = sanitizePgRegex(query);
+	if (!sanitized) return [];
 	const { sql: where, params } = whereClause(project, language, 2);
 	const sql = `
     SELECT id, file_path, language, symbol_type, symbol_name, start_line, end_line, content
@@ -84,7 +109,7 @@ async function regexSearch(
     ${where} AND content ~* $${params.length + 1}
     LIMIT $${params.length + 2}
   `;
-	params.push(query, limit);
+	params.push(sanitized, limit);
 	const { rows } = await pool.query(sql, params);
 	return rows as RawHit[];
 }
@@ -96,7 +121,8 @@ async function bm25Search(
 	language: string | undefined,
 	limit: number,
 ): Promise<RawHit[]> {
-	// ParadeDB pg_search: uses @@@ operator and pdb.score() for BM25 scoring
+	const sanitized = sanitizeBm25Query(query);
+	if (!sanitized) return [];
 	const { sql: where, params } = whereClause(project, language, 2);
 	const sql = `
     SELECT id, file_path, language, symbol_type, symbol_name, start_line, end_line, content,
@@ -106,7 +132,7 @@ async function bm25Search(
     ORDER BY score DESC
     LIMIT $${params.length + 2}
   `;
-	params.push(query, limit);
+	params.push(sanitized, limit);
 	const { rows } = await pool.query(sql, params);
 	return rows as RawHit[];
 }
@@ -131,6 +157,51 @@ async function semanticSearch(
 	params.push(vecStr, limit);
 	const { rows } = await pool.query(sql, params);
 	return rows as RawHit[];
+}
+
+// ── rg → DB lookup ─────────────────────────────────────────────────────────
+
+/**
+ * Run ripgrep, then look up matching chunks from DB for RRF fusion.
+ * Falls back to raw rg results (no DB id) if lookup fails.
+ */
+async function rgSearchWithLookup(
+	pool: Pool,
+	project: string,
+	rootDir: string,
+	query: string,
+	language: string | undefined,
+	limit: number,
+	signal?: AbortSignal,
+): Promise<RawHit[]> {
+	const rgMatches = await rgSearch(rootDir, query, {
+		language,
+		limit: limit * 2,
+		signal,
+	});
+	if (rgMatches.length === 0) return [];
+
+	// Look up DB chunks that overlap with rg match lines
+	const hits: RawHit[] = [];
+	for (const match of rgMatches) {
+		if (hits.length >= limit) break;
+		try {
+			const { rows } = await pool.query(
+				`SELECT id, file_path, language, symbol_type, symbol_name, start_line, end_line, content
+         FROM code_chunks
+         WHERE project = $1 AND file_path = $2
+           AND start_line <= $3 AND end_line >= $3
+         LIMIT 1`,
+				[project, match.file_path, match.line_number],
+			);
+			if (rows.length > 0) {
+				hits.push(rows[0] as RawHit);
+			}
+		} catch {
+			// DB lookup failed for this match, skip
+		}
+	}
+	return hits;
 }
 
 // ── RRF Fusion ──────────────────────────────────────────────────────────────
@@ -180,7 +251,7 @@ function rrfFuse(resultSets: RawHit[][], maxResults: number): SearchResult[] {
 	return scored.slice(0, maxResults);
 }
 
-// ── Main hybrid search ──────────────────────────────────────────────────────
+// ── Main hybrid search ────��─────────────────────────────────────────────────
 
 export async function hybridSearch(
 	pool: Pool,
@@ -188,79 +259,77 @@ export async function hybridSearch(
 ): Promise<SearchResult[]> {
 	const {
 		query,
-		mode: rawMode,
 		project,
 		language,
 		maxResults = 10,
 		signal,
+		rootDir,
 	} = options;
 
-	const mode = rawMode === "auto" ? detectMode(query) : rawMode;
 	const fetchLimit = maxResults * 3;
 
-	const resultSets: RawHit[][] = [];
-
-	// Always include BM25 keyword search (fast, no API call)
-	try {
-		const bm25Hits = await bm25Search(
-			pool,
-			project,
-			query,
-			language,
-			fetchLimit,
-		);
-		resultSets.push(bm25Hits);
-	} catch (err) {
-		console.error(
-			"[codebase-index] BM25 search failed:",
-			(err as Error).message,
-		);
-	}
-
-	// Regex search for regex/keyword modes
-	if (mode === "regex" || mode === "keyword") {
-		try {
-			const regexHits = await regexSearch(
-				pool,
-				project,
-				query,
-				language,
-				fetchLimit,
+	// Run ALL strategies in parallel
+	const [bm25Hits, regexHits, rgHits, semanticHits] = await Promise.all([
+		// BM25 — fast, no API call
+		bm25Search(pool, project, query, language, fetchLimit).catch((err) => {
+			console.error(
+				"[codebase-index] BM25 search failed:",
+				(err as Error).message,
 			);
-			resultSets.push(regexHits);
-		} catch (err) {
+			return [] as RawHit[];
+		}),
+		// pg_trgm regex
+		regexSearch(pool, project, query, language, fetchLimit).catch((err) => {
 			console.error(
 				"[codebase-index] regex search failed:",
 				(err as Error).message,
 			);
-		}
-	}
-
-	// Semantic search for semantic/auto modes
-	if (mode === "semantic" || mode === "auto") {
-		try {
-			const queryEmbedding = await embedQuery(query, signal);
-			const semanticHits = await semanticSearch(
-				pool,
-				project,
-				queryEmbedding,
-				language,
-				fetchLimit,
-			);
-			resultSets.push(semanticHits);
-		} catch (err) {
+			return [] as RawHit[];
+		}),
+		// ripgrep — fast file search, then DB lookup for chunk context
+		rgSearchWithLookup(
+			pool,
+			project,
+			rootDir,
+			query,
+			language,
+			fetchLimit,
+			signal,
+		).catch((err) => {
 			console.error(
-				"[codebase-index] semantic search failed:",
+				"[codebase-index] rg search failed:",
 				(err as Error).message,
 			);
-		}
-	}
+			return [] as RawHit[];
+		}),
+		// Semantic — needs embedding API call
+		embedQuery(query, signal)
+			.then((embedding) =>
+				semanticSearch(pool, project, embedding, language, fetchLimit),
+			)
+			.catch((err) => {
+				console.error(
+					"[codebase-index] semantic search failed:",
+					(err as Error).message,
+				);
+				return [] as RawHit[];
+			}),
+	]);
+
+	// Collect non-empty result sets for fusion
+	const resultSets: RawHit[][] = [];
+	if (bm25Hits.length > 0) resultSets.push(bm25Hits);
+	if (regexHits.length > 0) resultSets.push(regexHits);
+	if (rgHits.length > 0) resultSets.push(rgHits);
+	if (semanticHits.length > 0) resultSets.push(semanticHits);
+
+	if (resultSets.length === 0) return [];
 
 	// Fuse results with RRF
 	const fused = rrfFuse(resultSets, maxResults);
 
-	// Rerank if we have semantic or auto mode and results
-	if ((mode === "semantic" || mode === "auto") && fused.length > 0) {
+	// Rerank via DeepInfra
+	if (fused.length > 0) {
 		try {
 			const rerankItems: RerankItem[] = fused.map((r) => ({
 				id: r.id,
