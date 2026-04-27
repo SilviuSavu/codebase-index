@@ -8,9 +8,6 @@ services:
       POSTGRES_DB: codebase
       POSTGRES_USER: codebase
       POSTGRES_PASSWORD: codebase
-    command: >
-      postgres
-      -c cron.database_name=codebase
     volumes:
       - pgdata:/var/lib/postgresql
     healthcheck:

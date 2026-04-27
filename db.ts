@@ -103,17 +103,6 @@ export async function closePool(): Promise<void> {
 export async function ensureSchema(pool: Pool): Promise<void> {
 	await pool.query(SCHEMA_SQL);
 
-	// pg_cron needs to be created after the main schema in case it fails
-	try {
-		await pool.query("CREATE EXTENSION IF NOT EXISTS pg_cron");
-		// Schedule maintenance jobs
-		await pool.query(`
-			SELECT cron.schedule('0 */6 * * *', $$VACUUM ANALYZE code_chunks$$)
-		`);
-	} catch (err) {
-		console.error("[codebase-index] pg_cron setup failed:", (err as Error).message);
-	}
-
 	// Create BM25 index for full-text search (ParadeDB pg_search)
 	// Only one BM25 index per table, must include key_field first
 	try {
