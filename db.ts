@@ -11,7 +11,7 @@ import pg from "pg";
 const SCHEMA_SQL = `
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 CREATE EXTENSION IF NOT EXISTS vector;
-CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+CREATE EXTENSION IF NOT EXISTS pg_search;
 
 CREATE TABLE IF NOT EXISTS code_chunks (
     id          BIGSERIAL PRIMARY KEY,
@@ -31,7 +31,6 @@ CREATE TABLE IF NOT EXISTS code_chunks (
 
 CREATE INDEX IF NOT EXISTS idx_chunks_project ON code_chunks (project);
 CREATE INDEX IF NOT EXISTS idx_trgm ON code_chunks USING gin (content gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS idx_fts ON code_chunks USING gin (to_tsvector('english', content));
 CREATE INDEX IF NOT EXISTS idx_hash ON code_chunks (content_hash);
 CREATE INDEX IF NOT EXISTS idx_meta ON code_chunks USING gin (metadata);
 `;
@@ -96,6 +95,20 @@ export async function closePool(): Promise<void> {
 
 export async function ensureSchema(pool: Pool): Promise<void> {
 	await pool.query(SCHEMA_SQL);
+
+	// Create BM25 index for full-text search (ParadeDB pg_search)
+	// Only one BM25 index per table, must include key_field first
+	try {
+		await pool.query(`
+			CREATE INDEX IF NOT EXISTS idx_bm25 ON code_chunks
+			USING bm25 (id, content, file_path, symbol_name, symbol_type, language)
+			WITH (key_field = 'id')
+		`);
+	} catch (err) {
+		console.error("[codebase-index] BM25 index creation failed:", (err as Error).message);
+	}
+
+	// Create HNSW vector index when enough embeddings exist
 	const { rows } = await pool.query(
 		"SELECT count(*) as cnt FROM code_chunks WHERE embedding IS NOT NULL",
 	);

@@ -1,6 +1,6 @@
 services:
   pg:
-    image: pgvector/pgvector:pg17
+    image: paradedb/paradedb:latest
     container_name: pi-codebase-pg
     ports:
       - "5433:5432"

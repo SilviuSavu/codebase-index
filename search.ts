@@ -1,9 +1,9 @@
 /**
- * search.ts — Hybrid search: trigram + tsvector + pgvector → RRF → rerank
+ * search.ts — Hybrid search: trigram + BM25 + pgvector → RRF → rerank
  *
  * Combines three search strategies via Reciprocal Rank Fusion (RRF):
  * 1. pg_trgm — regex / fuzzy substring matching
- * 2. tsvector — full-text keyword search
+ * 2. BM25 (ParadeDB pg_search) — full-text keyword search with proper scoring
  * 3. pgvector — semantic vector similarity
  *
  * The results are fused with RRF, then optionally reranked via DeepInfra.
@@ -30,20 +30,13 @@ interface SearchOptions {
 
 /**
  * Detect the best search mode for a query.
- * Regex-like queries contain special chars; keyword queries have common words;
- * everything else defaults to semantic.
  */
 function detectMode(query: string): SearchMode {
-	// Regex indicators: contains regex metacharacters
 	if (/[\\^$.*+?[\]{}()|]/.test(query)) return "regex";
-
-	// Short keyword-like queries (mostly identifiers and operators)
 	const words = query.split(/\s+/);
 	if (words.length <= 3 && words.every((w) => /^[\w.]+$/.test(w))) {
 		return "keyword";
 	}
-
-	// Natural language — use semantic
 	return "semantic";
 }
 
@@ -60,6 +53,23 @@ interface RawHit {
 	content: string;
 }
 
+function whereClause(
+	project: string,
+	language: string | undefined,
+	paramOffset: number,
+): {
+	sql: string;
+	params: unknown[];
+} {
+	const params: unknown[] = [project];
+	let sql = `WHERE project = $1`;
+	if (language) {
+		sql += ` AND language = $${paramOffset}`;
+		params.push(language);
+	}
+	return { sql, params };
+}
+
 async function regexSearch(
 	pool: Pool,
 	project: string,
@@ -67,48 +77,36 @@ async function regexSearch(
 	language: string | undefined,
 	limit: number,
 ): Promise<RawHit[]> {
-	let sql = `
+	const { sql: where, params } = whereClause(project, language, 2);
+	const sql = `
     SELECT id, file_path, language, symbol_type, symbol_name, start_line, end_line, content
     FROM code_chunks
-    WHERE project = $1 AND content ~* $2
+    ${where} AND content ~* $${params.length + 1}
+    LIMIT $${params.length + 2}
   `;
-	const params: unknown[] = [project, query];
-
-	if (language) {
-		sql += ` AND language = $${params.length + 1}`;
-		params.push(language);
-	}
-
-	sql += ` LIMIT $${params.length + 1}`;
-	params.push(limit);
-
+	params.push(query, limit);
 	const { rows } = await pool.query(sql, params);
 	return rows as RawHit[];
 }
 
-async function keywordSearch(
+async function bm25Search(
 	pool: Pool,
 	project: string,
 	query: string,
 	language: string | undefined,
 	limit: number,
 ): Promise<RawHit[]> {
-	let sql = `
+	// ParadeDB pg_search: uses @@@ operator and pdb.score() for BM25 scoring
+	const { sql: where, params } = whereClause(project, language, 2);
+	const sql = `
     SELECT id, file_path, language, symbol_type, symbol_name, start_line, end_line, content,
-           ts_rank(to_tsvector('english', content), plainto_tsquery('english', $2)) AS rank
+           pdb.score(id) AS score
     FROM code_chunks
-    WHERE project = $1 AND to_tsvector('english', content) @@ plainto_tsquery('english', $2)
+    ${where} AND content @@@ paradedb.parse($${params.length + 1})
+    ORDER BY score DESC
+    LIMIT $${params.length + 2}
   `;
-	const params: unknown[] = [project, query];
-
-	if (language) {
-		sql += ` AND language = $${params.length + 1}`;
-		params.push(language);
-	}
-
-	sql += ` ORDER BY rank DESC LIMIT $${params.length + 1}`;
-	params.push(limit);
-
+	params.push(query, limit);
 	const { rows } = await pool.query(sql, params);
 	return rows as RawHit[];
 }
@@ -121,23 +119,16 @@ async function semanticSearch(
 	limit: number,
 ): Promise<RawHit[]> {
 	const vecStr = `[${queryEmbedding.join(",")}]`;
-
-	let sql = `
+	const { sql: where, params } = whereClause(project, language, 2);
+	const sql = `
     SELECT id, file_path, language, symbol_type, symbol_name, start_line, end_line, content,
-           1 - (embedding <=> $2::vector) AS similarity
+           1 - (embedding <=> $${params.length + 1}::vector) AS similarity
     FROM code_chunks
-    WHERE project = $1 AND embedding IS NOT NULL
+    ${where} AND embedding IS NOT NULL
+    ORDER BY embedding <=> $${params.length + 1}::vector
+    LIMIT $${params.length + 2}
   `;
-	const params: unknown[] = [project, vecStr];
-
-	if (language) {
-		sql += ` AND language = $${params.length + 1}`;
-		params.push(language);
-	}
-
-	sql += ` ORDER BY embedding <=> $2::vector LIMIT $${params.length + 1}`;
-	params.push(limit);
-
+	params.push(vecStr, limit);
 	const { rows } = await pool.query(sql, params);
 	return rows as RawHit[];
 }
@@ -145,7 +136,6 @@ async function semanticSearch(
 // ── RRF Fusion ──────────────────────────────────────────────────────────────
 
 function rrfFuse(resultSets: RawHit[][], maxResults: number): SearchResult[] {
-	// Build per-ID rank maps (1-based rank within each result set)
 	const idRanks = new Map<number, number[]>();
 
 	for (const hits of resultSets) {
@@ -159,7 +149,6 @@ function rrfFuse(resultSets: RawHit[][], maxResults: number): SearchResult[] {
 		});
 	}
 
-	// Collect all unique hits
 	const hitMap = new Map<number, RawHit>();
 	for (const hits of resultSets) {
 		for (const hit of hits) {
@@ -169,10 +158,9 @@ function rrfFuse(resultSets: RawHit[][], maxResults: number): SearchResult[] {
 		}
 	}
 
-	// Compute RRF scores
 	const scored: SearchResult[] = [];
 	for (const [id, ranks] of idRanks) {
-			const hit = hitMap.get(id);
+		const hit = hitMap.get(id);
 		if (!hit) continue;
 		const score = ranks.reduce((sum, rank) => sum + 1 / (RRF_K + rank), 0);
 		scored.push({
@@ -188,7 +176,6 @@ function rrfFuse(resultSets: RawHit[][], maxResults: number): SearchResult[] {
 		});
 	}
 
-	// Sort by score descending
 	scored.sort((a, b) => b.score - a.score);
 	return scored.slice(0, maxResults);
 }
@@ -209,28 +196,28 @@ export async function hybridSearch(
 	} = options;
 
 	const mode = rawMode === "auto" ? detectMode(query) : rawMode;
-	const fetchLimit = maxResults * 3; // Fetch more for better fusion
+	const fetchLimit = maxResults * 3;
 
 	const resultSets: RawHit[][] = [];
 
-	// Always include keyword search (fast, no API call)
+	// Always include BM25 keyword search (fast, no API call)
 	try {
-		const keywordHits = await keywordSearch(
+		const bm25Hits = await bm25Search(
 			pool,
 			project,
 			query,
 			language,
 			fetchLimit,
 		);
-		resultSets.push(keywordHits);
+		resultSets.push(bm25Hits);
 	} catch (err) {
 		console.error(
-			"[codebase-index] keyword search failed:",
+			"[codebase-index] BM25 search failed:",
 			(err as Error).message,
 		);
 	}
 
-	// Regex search for regex/keyword/auto modes
+	// Regex search for regex/keyword modes
 	if (mode === "regex" || mode === "keyword") {
 		try {
 			const regexHits = await regexSearch(
@@ -277,7 +264,7 @@ export async function hybridSearch(
 		try {
 			const rerankItems: RerankItem[] = fused.map((r) => ({
 				id: r.id,
-				text: r.content.slice(0, 2000), // Truncate for reranker context
+				text: r.content.slice(0, 2000),
 			}));
 
 			const reranked = await rerank(query, rerankItems, {
@@ -285,7 +272,6 @@ export async function hybridSearch(
 				topN: maxResults,
 			});
 
-			// Build final sorted results from reranker output
 			const resultMap = new Map(fused.map((r) => [r.id, r]));
 			return reranked
 				.map((rr) => {
