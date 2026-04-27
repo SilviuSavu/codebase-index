@@ -25,7 +25,6 @@ CREATE TABLE IF NOT EXISTS code_chunks (
     id          BIGSERIAL PRIMARY KEY,
     project     TEXT NOT NULL,
     file_path   TEXT NOT NULL,
-    file_path_ltree ltree GENERATED ALWAYS AS (replace(replace(file_path, '/', '.'), '_', '~')::ltree) STORED,
     language    TEXT,
     symbol_type TEXT,
     symbol_name TEXT,
@@ -42,7 +41,6 @@ CREATE INDEX IF NOT EXISTS idx_chunks_project ON code_chunks (project);
 CREATE INDEX IF NOT EXISTS idx_trgm ON code_chunks USING gin (content gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS idx_hash ON code_chunks (content_hash);
 CREATE INDEX IF NOT EXISTS idx_meta ON code_chunks USING gin (metadata);
-CREATE INDEX IF NOT EXISTS idx_ltree ON code_chunks USING gist (file_path_ltree);
 `;
 
 export interface ChunkRow {
