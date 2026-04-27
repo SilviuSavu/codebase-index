@@ -9,7 +9,7 @@ services:
       POSTGRES_USER: codebase
       POSTGRES_PASSWORD: codebase
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - pgdata:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U codebase -d codebase"]
       interval: 2s
