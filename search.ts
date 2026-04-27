@@ -69,9 +69,9 @@ function whereClause(
  * - Truncates to avoid huge patterns
  */
 function sanitizePgRegex(query: string): string {
-	let q = query.replace(/\s+/g, " ").trim();
+	let q = query.replaceAll(/\s+/g, " ").trim();
 	// Escape POSIX regex metacharacters so the query is treated as literal
-	q = q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	q = q.replaceAll(/[.*+?^${}()|[\]\\]/g, "\\$&");
 	if (q.length > 200) q = q.slice(0, 200);
 	return q;
 }
@@ -83,7 +83,7 @@ function sanitizePgRegex(query: string): string {
  */
 function sanitizeBm25Query(query: string): string {
 	// Collapse whitespace and strip newlines
-	let q = query.replace(/\s+/g, " ").trim();
+	let q = query.replaceAll(/\s+/g, " ").trim();
 	// Truncate long queries
 	if (q.length > 200) q = q.slice(0, 200);
 	// Extract word-like tokens for ParadeDB simple term query

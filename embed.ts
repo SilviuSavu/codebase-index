@@ -9,7 +9,7 @@ import { getDeepInfraKey } from "./keychain.js";
 
 const DEEPINFRA_URL = "https://api.deepinfra.com/v1/openai/embeddings";
 const MODEL = "Qwen/Qwen3-Embedding-8B";
-const EMBEDDING_DIM = 4096;
+const EMBEDDING_DIM = 1024;
 const BATCH_SIZE = 64;
 
 export interface EmbeddingResponse {

@@ -9,7 +9,9 @@
 import { createHash } from "node:crypto";
 import { readdir, readFile, stat } from "node:fs/promises";
 import { basename, extname, join, relative } from "node:path";
+import { astChunkFile, astChunksToRows, hasAstSupport } from "./ast_chunker.js";
 import type { ChunkRow } from "./db.js";
+import { fileHasChanged } from "./db.js";
 
 // ── Language detection ──────────────────────────────────────────────────────
 
@@ -115,7 +117,7 @@ const SKIP_FILES = new Set([
 
 const MAX_FILE_SIZE = 512 * 1024;
 const MAX_CHUNK_LINES = 150;
-const MIN_CHUNK_LINES = 4;
+const MIN_CHUNK_LINES = 6;
 const OVERLAP_LINES = 10;
 
 // ── Hashing ─────────────────────────────────────────────────────────────────
@@ -284,25 +286,7 @@ function buildSymbolChunks(
 ): ChunkRow[] {
 	const chunks: ChunkRow[] = [];
 
-	// Preamble before first symbol
-	const firstIdx = boundaries[0].lineIdx;
-	if (firstIdx > 0) {
-		const preamble = lines.slice(0, firstIdx);
-		if (preamble.filter(hasContent).length >= MIN_CHUNK_LINES) {
-			chunks.push(
-				makeChunk({
-					project,
-					filePath,
-					language,
-					symbolType: "module",
-					symbolName: null,
-					startLine: 1,
-					endLine: firstIdx,
-					lines: preamble,
-				}),
-			);
-		}
-	}
+	// Skip preamble (comments + imports) — never useful for search
 
 	// One chunk per symbol (sub-chunk large bodies)
 	for (let i = 0; i < boundaries.length; i++) {
@@ -381,12 +365,25 @@ function buildFallbackChunks(
 	return chunks;
 }
 
-function chunkFile(
+async function chunkFile(
 	project: string,
 	filePath: string,
 	language: string,
 	content: string,
-): ChunkRow[] {
+): Promise<ChunkRow[]> {
+	// Try AST chunking first (tree-sitter)
+	if (hasAstSupport(filePath)) {
+		try {
+			const astChunks = await astChunkFile(filePath, language, content);
+			if (astChunks && astChunks.length > 0) {
+				return astChunksToRows(project, filePath, language, astChunks);
+			}
+		} catch {
+			// Fall through to regex chunking
+		}
+	}
+
+	// Fallback: regex-based heuristic chunking
 	const lines = content.split("\n");
 	const boundaries = findBoundaries(lines);
 	if (boundaries.length === 0) {
@@ -448,6 +445,7 @@ async function processFile(
 	filePath: string,
 	project: string,
 	rootDir: string,
+	pool?: import("pg").Pool,
 ): Promise<ChunkRow[]> {
 	const info = await stat(filePath);
 	if (info.size > MAX_FILE_SIZE) return [];
@@ -459,6 +457,14 @@ async function processFile(
 	if (!language) return [];
 
 	const relPath = relative(rootDir, filePath);
+
+	// Merkle-tree check: skip if file content hasn't changed
+	if (pool) {
+		const hash = contentHash(content);
+		const changed = await fileHasChanged(pool, project, relPath, hash);
+		if (!changed) return [];
+	}
+
 	return chunkFile(project, relPath, language, content);
 }
 
@@ -469,6 +475,7 @@ export interface IndexingOptions {
 	rootDir: string;
 	signal?: AbortSignal;
 	onProgress?: (file: string, chunks: number) => void;
+	pool?: import("pg").Pool;
 }
 
 export interface IndexingResult {
@@ -502,7 +509,7 @@ export async function indexWorkspace(
 		const batch = files.slice(i, i + BATCH_SIZE);
 		const batchResults = await Promise.allSettled(
 			batch.map(async (filePath) => {
-				const chunks = await processFile(filePath, project, rootDir);
+				const chunks = await processFile(filePath, project, rootDir, options.pool);
 				if (chunks.length > 0) {
 					const relPath = relative(rootDir, filePath);
 					onProgress?.(relPath, chunks.length);
@@ -530,6 +537,7 @@ export async function indexFile(
 	project: string,
 	rootDir: string,
 	filePath: string,
+	pool?: import("pg").Pool,
 ): Promise<ChunkRow[]> {
-	return processFile(filePath, project, rootDir);
+	return processFile(filePath, project, rootDir, pool);
 }

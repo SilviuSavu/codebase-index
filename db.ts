@@ -11,6 +11,20 @@ import pg from "pg";
 const EXTENSIONS = [
 	'pg_trgm', 'vector', 'pg_search', 'pg_stat_statements',
 	'unaccent', 'fuzzystrmatch', 'pgcrypto', 'ltree', 'pg_ivm', 'hstore',
+] as const;
+
+// Pre-built SQL for each extension — no interpolation, safe from injection
+const EXTENSION_SQL: string[] = [
+	'CREATE EXTENSION IF NOT EXISTS "pg_trgm"',
+	'CREATE EXTENSION IF NOT EXISTS "vector"',
+	'CREATE EXTENSION IF NOT EXISTS "pg_search"',
+	'CREATE EXTENSION IF NOT EXISTS "pg_stat_statements"',
+	'CREATE EXTENSION IF NOT EXISTS "unaccent"',
+	'CREATE EXTENSION IF NOT EXISTS "fuzzystrmatch"',
+	'CREATE EXTENSION IF NOT EXISTS "pgcrypto"',
+	'CREATE EXTENSION IF NOT EXISTS "ltree"',
+	'CREATE EXTENSION IF NOT EXISTS "pg_ivm"',
+	'CREATE EXTENSION IF NOT EXISTS "hstore"',
 ];
 
 const TABLE_SQL = `
@@ -37,6 +51,16 @@ const INDEX_SQL = [
 	'CREATE INDEX IF NOT EXISTS idx_hash ON code_chunks (content_hash)',
 	'CREATE INDEX IF NOT EXISTS idx_meta ON code_chunks USING gin (metadata)',
 ];
+
+const FILE_HASHES_TABLE_SQL = `
+CREATE TABLE IF NOT EXISTS file_hashes (
+    project     TEXT NOT NULL,
+    file_path   TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    updated_at  TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (project, file_path)
+);
+`;
 
 export interface ChunkRow {
 	id?: number;
@@ -98,16 +122,19 @@ export async function closePool(): Promise<void> {
 
 export async function ensureSchema(pool: Pool): Promise<void> {
 	// Create extensions individually so one failure doesn't abort the rest
-	for (const ext of EXTENSIONS) {
+	for (let i = 0; i < EXTENSIONS.length; i++) {
 		try {
-			await pool.query(`CREATE EXTENSION IF NOT EXISTS ${ext}`);
+			await pool.query(EXTENSION_SQL[i]);
 		} catch (err) {
-			console.error(`[codebase-index] extension ${ext} failed:`, (err as Error).message);
+			console.error('[codebase-index] extension', EXTENSIONS[i], 'failed:', (err as Error).message);
 		}
 	}
 
 	// Create table
 	await pool.query(TABLE_SQL);
+
+	// Create file_hashes table for merkle-tree change detection
+	await pool.query(FILE_HASHES_TABLE_SQL);
 
 	// Create indexes individually
 	for (const sql of INDEX_SQL) {
@@ -129,17 +156,36 @@ export async function ensureSchema(pool: Pool): Promise<void> {
 		console.error("[codebase-index] BM25 index creation failed:", (err as Error).message);
 	}
 
-	// Create HNSW vector index when enough embeddings exist
-	const { rows } = await pool.query(
-		"SELECT count(*) as cnt FROM code_chunks WHERE embedding IS NOT NULL",
-	);
-	const count = Number(rows[0]?.cnt ?? 0);
-	if (count > 100) {
-		await pool.query(`
-      CREATE INDEX IF NOT EXISTS idx_vec ON code_chunks
-      USING hnsw (embedding vector_cosine_ops)
-      WITH (m = 16, ef_construction = 64)
-    `);
+	// Create vector index when enough embeddings exist
+	try {
+		const { rows } = await pool.query(
+			"SELECT count(*) as cnt FROM code_chunks WHERE embedding IS NOT NULL",
+		);
+		const count = Number(rows[0]?.cnt ?? 0);
+		if (count > 100) {
+			// Try HNSW first (fast, but pgvector limits dimensions to 2000)
+			try {
+				await pool.query(`
+					CREATE INDEX IF NOT EXISTS idx_vec ON code_chunks
+					USING hnsw (embedding vector_cosine_ops)
+					WITH (m = 16, ef_construction = 64)
+				`);
+			} catch {
+				// HNSW failed (likely dimension > 2000), fall back to IVFFlat
+				console.log('[codebase-index] HNSW index not supported, trying IVFFlat...');
+				try {
+					await pool.query(`
+						CREATE INDEX IF NOT EXISTS idx_vec ON code_chunks
+						USING ivfflat (embedding vector_cosine_ops)
+						WITH (lists = 100)
+					`);
+				} catch (ivfErr) {
+					console.error('[codebase-index] IVFFlat index also failed:', (ivfErr as Error).message);
+				}
+			}
+		}
+	} catch (err) {
+		console.error('[codebase-index] vector index creation failed:', (err as Error).message);
 	}
 }
 
@@ -318,4 +364,48 @@ export async function isHealthy(pool: Pool): Promise<boolean> {
 	} catch {
 		return false;
 	}
+}
+
+// ── File-level hash for merkle-tree change detection ────────────────────────
+
+/** Check if a file has changed since last index. Returns true if file needs re-indexing. */
+export async function fileHasChanged(
+	pool: Pool,
+	project: string,
+	filePath: string,
+	contentHash: string,
+): Promise<boolean> {
+	const { rows } = await pool.query(
+		"SELECT content_hash FROM file_hashes WHERE project = $1 AND file_path = $2",
+		[project, filePath],
+	);
+	if (rows.length === 0) return true;
+	return rows[0].content_hash !== contentHash;
+}
+
+/** Store the file hash after successful indexing. */
+export async function upsertFileHash(
+	pool: Pool,
+	project: string,
+	filePath: string,
+	contentHash: string,
+): Promise<void> {
+	await pool.query(
+		`INSERT INTO file_hashes (project, file_path, content_hash, updated_at)
+     VALUES ($1, $2, $3, NOW())
+     ON CONFLICT (project, file_path) DO UPDATE SET content_hash = $3, updated_at = NOW()`,
+		[project, filePath, contentHash],
+	);
+}
+
+/** Remove file hash entry (when file is deleted). */
+export async function deleteFileHash(
+	pool: Pool,
+	project: string,
+	filePath: string,
+): Promise<void> {
+	await pool.query(
+		"DELETE FROM file_hashes WHERE project = $1 AND file_path = $2",
+		[project, filePath],
+	);
 }

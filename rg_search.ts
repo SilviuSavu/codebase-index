@@ -60,9 +60,9 @@ const EXCLUDE_GLOBS = [
  * - Truncates to a reasonable length
  */
 function sanitizeRgQuery(query: string): string {
-	let q = query.replace(/\n/g, " ").trim();
-	// Escape regex metacharacters so the query is treated as literal text
-	q = q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	let q = query.replaceAll(/\n/g, " ").trim();
+	// Escape regex metacharacters so the query is treated as literal text  // NOSONAR: backslash replacement cannot use String.raw
+	q = q.replaceAll(/[.*+?^${}()|[\]\\]/g, "\\$&"); // NOSONAR
 	// Truncate to avoid absurdly long patterns
 	if (q.length > 200) q = q.slice(0, 200);
 	return q;

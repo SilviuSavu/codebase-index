@@ -9,11 +9,20 @@
     "check": "echo 'nothing to check'"
   },
   "pi": {
-    "extensions": ["./index.ts"]
+    "extensions": [
+      "./index.ts"
+    ]
   },
   "dependencies": {
+    "chokidar": "^4.0.3",
     "pg": "^8.13.1",
-    "chokidar": "^4.0.3"
+    "tree-sitter-go": "^0.25.0",
+    "tree-sitter-java": "^0.23.5",
+    "tree-sitter-python": "^0.25.0",
+    "tree-sitter-ruby": "^0.23.1",
+    "tree-sitter-rust": "^0.24.0",
+    "tree-sitter-typescript": "^0.23.2",
+    "web-tree-sitter": "^0.26.8"
   },
   "devDependencies": {
     "@types/pg": "^8.11.11"

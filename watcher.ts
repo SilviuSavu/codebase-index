@@ -7,7 +7,13 @@
 
 import { relative, resolve } from "node:path";
 import type { Pool } from "pg";
-import { deleteFileChunks, upsertChunks } from "./db.js";
+import {
+	deleteFileChunks,
+	getChunksWithoutEmbeddings,
+	updateEmbeddings,
+	upsertChunks,
+} from "./db.js";
+import { generateEmbeddings } from "./embed.js";
 import { indexFile, isSourceFile } from "./indexer.js";
 
 // Try to import chokidar — it's an optional dependency
@@ -50,35 +56,55 @@ export async function startWatcher(
 	let pending: PendingChange[] = [];
 	let debounceTimer: ReturnType<typeof setTimeout> | null = null;
 
+	async function backfillEmbeddings(): Promise<void> {
+		try {
+			const unembedded = await getChunksWithoutEmbeddings(pool, project, 64);
+			if (unembedded.length === 0) return;
+			const texts = unembedded.map((c) => c.content);
+			const { embeddings } = await generateEmbeddings(texts);
+			const map = new Map<number, number[]>();
+			for (let i = 0; i < unembedded.length; i++) {
+				const id = unembedded[i].id;
+				if (id !== undefined && embeddings[i]) map.set(id, embeddings[i]);
+			}
+			await updateEmbeddings(pool, map);
+		} catch (embedErr) {
+			console.error(
+				"[codebase-index] watcher embedding backfill failed:",
+				(embedErr as Error).message,
+			);
+		}
+	}
+
+	async function processFileChange(change: PendingChange): Promise<void> {
+		if (change.type === "unlink") {
+			await deleteFileChunks(pool, project, relative(rootDir, change.filePath));
+			return;
+		}
+		const chunks = await indexFile(project, rootDir, change.filePath, pool);
+		if (chunks.length === 0) return;
+		await upsertChunks(pool, chunks);
+		onReindex?.(relative(rootDir, change.filePath), chunks.length);
+		await backfillEmbeddings();
+	}
+
 	async function processPending(): Promise<void> {
 		const changes = pending.slice();
 		pending = [];
 		debounceTimer = null;
-
 		if (changes.length === 0) return;
 
 		// Deduplicate — keep last operation per file
 		const byFile = new Map<string, PendingChange>();
-		for (const change of changes) {
-			byFile.set(change.filePath, change);
-		}
+		for (const change of changes) byFile.set(change.filePath, change);
 
 		for (const change of byFile.values()) {
 			try {
-				if (change.type === "unlink") {
-					const relPath = relative(rootDir, change.filePath);
-					await deleteFileChunks(pool, project, relPath);
-				} else {
-					const chunks = await indexFile(project, rootDir, change.filePath);
-					if (chunks.length > 0) {
-						await upsertChunks(pool, chunks);
-						const relPath = relative(rootDir, change.filePath);
-						onReindex?.(relPath, chunks.length);
-					}
-				}
+				await processFileChange(change);
 			} catch (err) {
 				console.error(
-					`[codebase-index] error processing ${change.filePath}:`,
+					"[codebase-index] error processing %s:",
+					change.filePath,
 					(err as Error).message,
 				);
 			}

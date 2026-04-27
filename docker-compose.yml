@@ -16,6 +16,25 @@ services:
       timeout: 3s
       retries: 20
 
+  graph:
+    image: apache/age:latest
+    container_name: pi-codebase-graph
+    ports:
+      - "5434:5432"
+    environment:
+      POSTGRES_DB: codegraph
+      POSTGRES_USER: codegraph
+      POSTGRES_PASSWORD: codegraph
+    volumes:
+      - graphdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U codegraph -d codegraph"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
 volumes:
   pgdata:
     name: pi-codebase-pgdata
+  graphdata:
+    name: pi-codebase-graphdata
