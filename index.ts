@@ -9,8 +9,8 @@
  *                                          │
  *                     ┌────────────────────┤
  *                     ▼                    ▼
- *             PostgreSQL (Docker)    OpenRouter API
- *             pg_trgm (regex)        Qwen3-Embedding
+ *             PostgreSQL (Docker)    DeepInfra API
+ *             pg_trgm (regex)        Qwen3-Embedding-8B
  *             tsvector (keyword)
  *             pgvector (semantic)    DeepInfra API
  *             JSONB (meta)           Qwen3-Reranker
@@ -32,7 +32,7 @@ import {
 } from "./db.js";
 import { generateEmbeddings } from "./embed.js";
 import { type IndexingResult, indexWorkspace } from "./indexer.js";
-import { getDeepInfraKey, getOpenRouterKey } from "./keychain.js";
+import { getDeepInfraKey } from "./keychain.js";
 import { hybridSearch, type SearchMode } from "./search.js";
 import { type FileWatcher, startWatcher } from "./watcher.js";
 
@@ -127,7 +127,6 @@ async function backfillEmbeddings(
 // ── Status display helper ───────────────────────────────────────────────────
 
 interface StatusInfo {
-	hasOpenRouter: boolean;
 	hasDeepInfra: boolean;
 	chunkCount: number;
 	embeddedCount: number;
@@ -140,10 +139,10 @@ function formatStatus(info: StatusInfo): string {
 		`Total chunks: ${info.chunkCount}`,
 		`With embeddings: ${info.embeddedCount} / ${info.chunkCount}`,
 	];
-	if (info.hasOpenRouter) {
-		lines.push("Semantic search: OPENROUTER_API_KEY set");
+	if (info.hasDeepInfra) {
+		lines.push("Semantic search: DEEPINFRA_API_KEY set");
 	} else {
-		lines.push("Semantic search: OPENROUTER_API_KEY missing");
+		lines.push("Semantic search: DEEPINFRA_API_KEY missing");
 	}
 	if (info.hasDeepInfra) {
 		lines.push("Reranking: DEEPINFRA_API_KEY set");
@@ -428,7 +427,6 @@ export default function codebaseIndexExtension(pi: ExtensionAPI) {
 					project,
 					chunkCount,
 					embeddedCount,
-					hasOpenRouter: !!getOpenRouterKey(),
 					hasDeepInfra: !!getDeepInfraKey(),
 				}),
 				"info",

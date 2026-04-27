@@ -114,9 +114,9 @@ const SKIP_FILES = new Set([
 ]);
 
 const MAX_FILE_SIZE = 512 * 1024;
-const MAX_CHUNK_LINES = 200;
-const MIN_CHUNK_LINES = 6;
-const OVERLAP_LINES = 4;
+const MAX_CHUNK_LINES = 150;
+const MIN_CHUNK_LINES = 4;
+const OVERLAP_LINES = 10;
 
 // ── Hashing ─────────────────────────────────────────────────────────────────
 

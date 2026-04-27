@@ -7,7 +7,7 @@
 import { getDeepInfraKey } from "./keychain.js";
 
 const DEEPINFRA_URL = "https://api.deepinfra.com/v1/rerank";
-const MODEL = "Qwen/Qwen3-Reranker-0.6B";
+const MODEL = "Qwen/Qwen3-Reranker-8B";
 const MAX_RERANK_DOCS = 20;
 
 export interface RerankItem {

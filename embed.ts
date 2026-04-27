@@ -1,15 +1,15 @@
 /**
- * embed.ts — Embedding generation via OpenRouter API
+ * embed.ts — Embedding generation via DeepInfra API
  *
- * Uses Qwen3-Embedding-0.6B (1024d, 32K context) through OpenRouter.
+ * Uses Qwen3-Embedding-8B (4096d, 32K context) through DeepInfra.
  * Batches embedding requests for efficiency.
  */
 
-import { getOpenRouterKey } from "./keychain.js";
+import { getDeepInfraKey } from "./keychain.js";
 
-const OPENROUTER_URL = "https://openrouter.ai/api/v1/embeddings";
-const MODEL = "qwen/qwen3-embedding";
-const EMBEDDING_DIM = 1024;
+const DEEPINFRA_URL = "https://api.deepinfra.com/v1/openai/embeddings";
+const MODEL = "Qwen/Qwen3-Embedding-8B";
+const EMBEDDING_DIM = 4096;
 const BATCH_SIZE = 64;
 
 export interface EmbeddingResponse {
@@ -18,12 +18,12 @@ export interface EmbeddingResponse {
 }
 
 async function getApiKey(): Promise<string> {
-  const key = getOpenRouterKey();
+  const key = getDeepInfraKey();
   if (!key) {
     throw new Error(
-      "OPENROUTER_API_KEY not found in env or Keychain. " +
-      "Set it with: export OPENROUTER_API_KEY=... or " +
-      "security add-generic-password -a openrouter -s OPENROUTER_API_KEY -w <key>"
+      "DEEPINFRA_API_KEY not found in env or Keychain. " +
+      "Set it with: export DEEPINFRA_API_KEY=... or " +
+      "security add-generic-password -a deepinfra -s DEEPINFRA_API_KEY -w <key>"
     );
   }
   return key;
@@ -33,7 +33,7 @@ async function embedBatch(
   texts: string[],
   signal?: AbortSignal
 ): Promise<EmbeddingResponse> {
-  const resp = await fetch(OPENROUTER_URL, {
+  const resp = await fetch(DEEPINFRA_URL, {
     method: "POST",
     headers: {
       "Authorization": `Bearer ${await getApiKey()}`,
@@ -50,7 +50,7 @@ async function embedBatch(
   if (!resp.ok) {
     const body = await resp.text().catch(() => "");
     throw new Error(
-      `OpenRouter embedding API error ${resp.status}: ${body.slice(0, 200)}`
+      `DeepInfra embedding API error ${resp.status}: ${body.slice(0, 200)}`
     );
   }
 
