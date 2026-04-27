@@ -1,0 +1,21 @@
+{
+  "name": "pi-codebase-index",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "clean": "rm -rf node_modules",
+    "build": "echo 'nothing to build (TypeScript via jiti)'",
+    "check": "echo 'nothing to check'"
+  },
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "dependencies": {
+    "pg": "^8.13.1",
+    "chokidar": "^4.0.3"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.11.11"
+  }
+}

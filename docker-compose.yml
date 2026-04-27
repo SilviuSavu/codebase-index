@@ -1,0 +1,21 @@
+services:
+  pg:
+    image: pgvector/pgvector:pg17
+    container_name: pi-codebase-pg
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_DB: codebase
+      POSTGRES_USER: codebase
+      POSTGRES_PASSWORD: codebase
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U codebase -d codebase"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  pgdata:
+    name: pi-codebase-pgdata
