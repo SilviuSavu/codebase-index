@@ -12,7 +12,6 @@ const SCHEMA_SQL = `
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_search;
-CREATE EXTENSION IF NOT EXISTS pg_cron;
 CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
 CREATE EXTENSION IF NOT EXISTS unaccent;
 CREATE EXTENSION IF NOT EXISTS fuzzystrmatch;
@@ -104,6 +103,17 @@ export async function closePool(): Promise<void> {
 export async function ensureSchema(pool: Pool): Promise<void> {
 	await pool.query(SCHEMA_SQL);
 
+	// pg_cron needs to be created after the main schema in case it fails
+	try {
+		await pool.query("CREATE EXTENSION IF NOT EXISTS pg_cron");
+		// Schedule maintenance jobs
+		await pool.query(`
+			SELECT cron.schedule('0 */6 * * *', $$VACUUM ANALYZE code_chunks$$)
+		`);
+	} catch (err) {
+		console.error("[codebase-index] pg_cron setup failed:", (err as Error).message);
+	}
+
 	// Create BM25 index for full-text search (ParadeDB pg_search)
 	// Only one BM25 index per table, must include key_field first
 	try {
@@ -127,22 +137,6 @@ export async function ensureSchema(pool: Pool): Promise<void> {
       USING hnsw (embedding vector_cosine_ops)
       WITH (m = 16, ef_construction = 64)
     `);
-	}
-
-	// Schedule maintenance jobs via pg_cron
-	try {
-		await pool.query(`
-			SELECT cron.schedule('0 */6 * * *', $$
-				VACUUM ANALYZE code_chunks
-			$$);
-		`);
-		await pool.query(`
-			SELECT cron.schedule('30 */6 * * *', $$
-				REINDEX INDEX CONCURRENTLY IF EXISTS idx_bm25
-			$$);
-		`);
-	} catch (err) {
-		console.error("[codebase-index] pg_cron scheduling failed:", (err as Error).message);
 	}
 }
 
