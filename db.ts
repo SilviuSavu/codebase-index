@@ -8,18 +8,12 @@
 import type { Pool, PoolConfig } from "pg";
 import pg from "pg";
 
-const SCHEMA_SQL = `
-CREATE EXTENSION IF NOT EXISTS pg_trgm;
-CREATE EXTENSION IF NOT EXISTS vector;
-CREATE EXTENSION IF NOT EXISTS pg_search;
-CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
-CREATE EXTENSION IF NOT EXISTS unaccent;
-CREATE EXTENSION IF NOT EXISTS fuzzystrmatch;
-CREATE EXTENSION IF NOT EXISTS pgcrypto;
-CREATE EXTENSION IF NOT EXISTS ltree;
-CREATE EXTENSION IF NOT EXISTS pg_ivm;
-CREATE EXTENSION IF NOT EXISTS hstore;
+const EXTENSIONS = [
+	'pg_trgm', 'vector', 'pg_search', 'pg_stat_statements',
+	'unaccent', 'fuzzystrmatch', 'pgcrypto', 'ltree', 'pg_ivm', 'hstore',
+];
 
+const TABLE_SQL = `
 CREATE TABLE IF NOT EXISTS code_chunks (
     id          BIGSERIAL PRIMARY KEY,
     project     TEXT NOT NULL,
@@ -35,12 +29,14 @@ CREATE TABLE IF NOT EXISTS code_chunks (
     metadata    JSONB DEFAULT '{}',
     indexed_at  TIMESTAMPTZ DEFAULT NOW()
 );
-
-CREATE INDEX IF NOT EXISTS idx_chunks_project ON code_chunks (project);
-CREATE INDEX IF NOT EXISTS idx_trgm ON code_chunks USING gin (content gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS idx_hash ON code_chunks (content_hash);
-CREATE INDEX IF NOT EXISTS idx_meta ON code_chunks USING gin (metadata);
 `;
+
+const INDEX_SQL = [
+	'CREATE INDEX IF NOT EXISTS idx_chunks_project ON code_chunks (project)',
+	'CREATE INDEX IF NOT EXISTS idx_trgm ON code_chunks USING gin (content gin_trgm_ops)',
+	'CREATE INDEX IF NOT EXISTS idx_hash ON code_chunks (content_hash)',
+	'CREATE INDEX IF NOT EXISTS idx_meta ON code_chunks USING gin (metadata)',
+];
 
 export interface ChunkRow {
 	id?: number;
@@ -101,10 +97,28 @@ export async function closePool(): Promise<void> {
 }
 
 export async function ensureSchema(pool: Pool): Promise<void> {
-	await pool.query(SCHEMA_SQL);
+	// Create extensions individually so one failure doesn't abort the rest
+	for (const ext of EXTENSIONS) {
+		try {
+			await pool.query(`CREATE EXTENSION IF NOT EXISTS ${ext}`);
+		} catch (err) {
+			console.error(`[codebase-index] extension ${ext} failed:`, (err as Error).message);
+		}
+	}
+
+	// Create table
+	await pool.query(TABLE_SQL);
+
+	// Create indexes individually
+	for (const sql of INDEX_SQL) {
+		try {
+			await pool.query(sql);
+		} catch (err) {
+			console.error("[codebase-index] index creation failed:", (err as Error).message);
+		}
+	}
 
 	// Create BM25 index for full-text search (ParadeDB pg_search)
-	// Only one BM25 index per table, must include key_field first
 	try {
 		await pool.query(`
 			CREATE INDEX IF NOT EXISTS idx_bm25 ON code_chunks
